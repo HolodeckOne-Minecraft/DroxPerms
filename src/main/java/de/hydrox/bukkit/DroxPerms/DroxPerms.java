@@ -1,12 +1,12 @@
 package de.hydrox.bukkit.DroxPerms;
 
-import java.io.IOException;
 import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.logging.Logger;
 
+import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.permissions.PermissionAttachment;
@@ -14,9 +14,9 @@ import org.bukkit.plugin.PluginManager;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
+import de.hydrox.bukkit.DroxPerms.data.AUser;
 import de.hydrox.bukkit.DroxPerms.data.Config;
 import de.hydrox.bukkit.DroxPerms.data.IDataProvider;
-import de.hydrox.bukkit.DroxPerms.data.flatfile.FlatFilePermissions;
 import de.hydrox.bukkit.DroxPerms.data.sql.SQLPermissions;
 
 /**
@@ -30,12 +30,9 @@ public class DroxPerms extends JavaPlugin {
 	private DroxPlayerListener playerListener = new DroxPlayerListener(this);
 	private DroxGroupCommands groupCommandExecutor = new DroxGroupCommands(this);
 	private DroxPlayerCommands playerCommandExecutor = new DroxPlayerCommands(this);
-	private DroxTestCommands testCommandExecutor = new DroxTestCommands();
 	private DroxStatsCommands statsCommandExecutor = new DroxStatsCommands(this);
 	private Map<Player, Map<String, PermissionAttachment>> permissions = new HashMap<Player, Map<String, PermissionAttachment>>();
 	private DroxPermsAPI API = null;
-
-	private Metrics metrics = null;
 
 	private Runnable commiter;
 	private BukkitTask task;
@@ -64,17 +61,23 @@ public class DroxPerms extends JavaPlugin {
 		saveConfig();
 		new Config(this);
 		logger.info("[DroxPerms] Loading DataProvider");
-		if (Config.getDataProvider().equalsIgnoreCase(FlatFilePermissions.NODE)) {
-			dataProvider = new FlatFilePermissions(this);
-		} else if (Config.getDataProvider().equalsIgnoreCase(SQLPermissions.NODE)) {
+		if (Config.getDataProvider().equalsIgnoreCase(SQLPermissions.NODE)) {
 			try {
 				dataProvider = new SQLPermissions(Config.getMySQLConfig(), this);
 			} catch (SQLException e) {
 				SQLPermissions.mysqlError(e);
 			}
-		} else {
-			logger.warning("No DataProvider named \""+Config.getDataProvider()+ "\" available. Falling back to " + FlatFilePermissions.NODE);
-			dataProvider = new FlatFilePermissions(this);
+		}
+		
+		if (!dataProvider.migrateToNewerVersion()) {
+			try {
+				Thread.sleep(1000);
+			} catch (InterruptedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+			System.exit(-1);
+			return;
 		}
 
 		API = new DroxPermsAPI(this);
@@ -83,7 +86,6 @@ public class DroxPerms extends JavaPlugin {
 		logger.info("[DroxPerms] Setting CommandExecutors");
 		getCommand("changegroup").setExecutor(groupCommandExecutor);
 		getCommand("changeplayer").setExecutor(playerCommandExecutor);
-		getCommand("testdroxperms").setExecutor(testCommandExecutor);
 		getCommand("droxstats").setExecutor(statsCommandExecutor);
 
 		// Events
@@ -100,18 +102,16 @@ public class DroxPerms extends JavaPlugin {
 		enableScheduler();
 
 		logger.info("[DroxPerms] Plugin activated in " + (System.currentTimeMillis() - time) + "ms.");
-
-		initMetrics();
 	}
 
 	public DroxPermsAPI getAPI() {
 		return API;
 	}
 
-	private String getPrefix(String player) {
-		String prefix = API.getPlayerInfo(player, "display_prefix");
+	private String getPrefix(AUser user) {
+		String prefix = API.getPlayerInfo(user.getUUID(), "display_prefix");
 		if (prefix == null) {
-			String group = API.getPlayerGroup(player);
+			String group = API.getPlayerGroup(user.getUUID());
 			prefix = API.getGroupInfo(group, "display_prefix");
 		}
 		if (prefix != null) {
@@ -123,7 +123,7 @@ public class DroxPerms extends JavaPlugin {
 	protected void registerPlayer(Player player) {
 		permissions.remove(player);
 		registerPlayer(player, player.getWorld());
-		String displayName = getPrefix(player.getName()) + player.getDisplayName();
+		String displayName = getPrefix(dataProvider.getUserByUUID(player.getUniqueId())) + player.getDisplayName();
 		if (displayName.length()>16) {
 			displayName = displayName.substring(0, 16);
 		}
@@ -162,6 +162,14 @@ public class DroxPerms extends JavaPlugin {
 		}
 	}
 
+	protected void refreshPlayer(AUser user) {
+		if (user == null) {
+			return;
+		}
+		Player player = Bukkit.getPlayer(user.getUUID());
+		refreshPlayer(player);
+	}
+
 	protected void refreshPlayer(Player player) {
 		if (player == null) {
 			return;
@@ -191,11 +199,22 @@ public class DroxPerms extends JavaPlugin {
 				.get(player);
 
 		PermissionAttachment attachment = attachments.get("group");
+		AUser user = dataProvider.getUserByUUID(player.getUniqueId());
 		Map<String, Map<String, Boolean>> playerPermissions = dataProvider
-				.getPlayerPermissions(player.getName(), world.getName(), false);
+				.getPlayerPermissions(user, world.getName());
 		Map<String, Boolean> perms = playerPermissions.get("group");
+		Map<String, Boolean> negPerms = new HashMap<String, Boolean>();
 		if (perms != null) {
 			for (String entry : perms.keySet()) {
+				if(!perms.get(entry)) {
+					negPerms.put(entry, perms.get(entry));
+					continue;
+				}
+				attachment.setPermission(entry, perms.get(entry));
+				logger.fine("[DroxPerms] Setting " + entry
+						+ " to " + perms.get(entry) + " for player " + player.getName());
+			}
+			for (String entry : negPerms.keySet()) {
 				attachment.setPermission(entry, perms.get(entry));
 				logger.fine("[DroxPerms] Setting " + entry
 						+ " to " + perms.get(entry) + " for player " + player.getName());
@@ -203,8 +222,18 @@ public class DroxPerms extends JavaPlugin {
 		}
 		attachment = attachments.get("subgroups");
 		perms = playerPermissions.get("subgroups");
+		negPerms.clear();
 		if (perms != null) {
 			for (String entry : perms.keySet()) {
+				if(!perms.get(entry)) {
+					negPerms.put(entry, perms.get(entry));
+					continue;
+				}
+				attachment.setPermission(entry, perms.get(entry));
+				logger.fine("[DroxPerms] Setting " + entry
+						+ " to " + perms.get(entry) + " for player " + player.getName());
+			}
+			for (String entry : negPerms.keySet()) {
 				attachment.setPermission(entry, perms.get(entry));
 				logger.fine("[DroxPerms] Setting " + entry
 						+ " to " + perms.get(entry) + " for player " + player.getName());
@@ -212,8 +241,18 @@ public class DroxPerms extends JavaPlugin {
 		}
 		attachment = attachments.get("global");
 		perms = playerPermissions.get("global");
+		negPerms.clear();
 		if (perms != null) {
 			for (String entry : perms.keySet()) {
+				if(!perms.get(entry)) {
+					negPerms.put(entry, perms.get(entry));
+					continue;
+				}
+				attachment.setPermission(entry, perms.get(entry));
+				logger.fine("[DroxPerms] Setting " + entry
+						+ " to " + perms.get(entry) + " for player " + player.getName());
+			}
+			for (String entry : negPerms.keySet()) {
 				attachment.setPermission(entry, perms.get(entry));
 				logger.fine("[DroxPerms] Setting " + entry
 						+ " to " + perms.get(entry) + " for player " + player.getName());
@@ -222,8 +261,18 @@ public class DroxPerms extends JavaPlugin {
 
 		attachment = attachments.get("world");
 		perms = playerPermissions.get("world");
+		negPerms.clear();
 		if (perms != null) {
 			for (String entry : perms.keySet()) {
+				if(!perms.get(entry)) {
+					negPerms.put(entry, perms.get(entry));
+					continue;
+				}
+				attachment.setPermission(entry, perms.get(entry));
+				logger.fine("[DroxPerms] Setting " + entry
+						+ " to " + perms.get(entry) + " for player " + player.getName());
+			}
+			for (String entry : negPerms.keySet()) {
 				attachment.setPermission(entry, perms.get(entry));
 				logger.fine("[DroxPerms] Setting " + entry
 						+ " to " + perms.get(entry) + " for player " + player.getName());
@@ -246,302 +295,5 @@ public class DroxPerms extends JavaPlugin {
 			task = null;
 			logger.info("[DroxPerms] Deactivated Save-Thread.");
 		}
-	}
-
-	private void initMetrics() {
-		try {
-			metrics = new Metrics(this);
-		} catch (IOException e) {
-			e.printStackTrace();
-		}
-		initAPIMetrics(metrics);
-		initCommandMetrics(metrics);
-
-	}
-
-	private void initAPIMetrics(Metrics metrics) {
-		Metrics.Graph graph = metrics.createGraph("API Usage (Players)");
-
-		// Info Get
-		graph.addPlotter(new Metrics.DroxPlotter("Info Get") {
-			@Override
-			public int getValue() {
-				int value = API.playerInfoGet;
-				API.playerInfoGet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Info Set
-		graph.addPlotter(new Metrics.DroxPlotter("Info Set") {
-			@Override
-			public int getValue() {
-				int value = API.playerInfoSet;
-				API.playerInfoSet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Add Permission
-		graph.addPlotter(new Metrics.DroxPlotter("Permission Add") {
-			@Override
-			public int getValue() {
-				int value = API.playerPermAdd;
-				API.playerPermAdd = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Remove Permission
-		graph.addPlotter(new Metrics.DroxPlotter("Permission Remove") {
-			@Override
-			public int getValue() {
-				int value = API.playerPermRem;
-				API.playerPermRem = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Group Get
-		graph.addPlotter(new Metrics.DroxPlotter("Group Get") {
-			@Override
-			public int getValue() {
-				int value = API.playerGroupGet;
-				API.playerGroupGet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Group Set
-		graph.addPlotter(new Metrics.DroxPlotter("Group Set") {
-			@Override
-			public int getValue() {
-				int value = API.playerGroupSet;
-				API.playerGroupSet = 0;
-				return getAvg(value);
-			}
-		});
-
-		Metrics.Graph graph2 = metrics.createGraph("API Usage (Groups)");
-
-		// Info Get
-		graph2.addPlotter(new Metrics.DroxPlotter("Info Get") {
-			@Override
-			public int getValue() {
-				int value = API.groupInfoGet;
-				API.groupInfoGet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Info Set
-		graph2.addPlotter(new Metrics.DroxPlotter("Info Set") {
-			@Override
-			public int getValue() {
-				int value = API.groupInfoSet;
-				API.groupInfoSet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Add Permission
-		graph2.addPlotter(new Metrics.DroxPlotter("Permission Add") {
-			@Override
-			public int getValue() {
-				int value = API.groupPermAdd;
-				API.groupPermAdd = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Remove Permission
-		graph2.addPlotter(new Metrics.DroxPlotter("Permission Remove") {
-			@Override
-			public int getValue() {
-				int value = API.groupPermRem;
-				API.groupPermRem = 0;
-				return getAvg(value);
-			}
-		});
-
-		metrics.start();
-	}
-
-	private void initCommandMetrics(Metrics metrics) {
-		Metrics.Graph graph = metrics.createGraph("Command Usage (Players)");
-
-		// Info Set
-		graph.addPlotter(new Metrics.DroxPlotter("Info Set") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerInfoSet;
-				playerCommandExecutor.playerInfoSet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Add Permission
-		graph.addPlotter(new Metrics.DroxPlotter("Permission Add") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerPermAdd;
-				playerCommandExecutor.playerPermAdd = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Remove Permission
-		graph.addPlotter(new Metrics.DroxPlotter("Permission Remove") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerPermRem;
-				playerCommandExecutor.playerPermRem = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Group Set
-		graph.addPlotter(new Metrics.DroxPlotter("Group Set") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerGroupSet;
-				playerCommandExecutor.playerGroupSet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Promote
-		graph.addPlotter(new Metrics.DroxPlotter("Promote") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerPromote;
-				playerCommandExecutor.playerPromote = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Demote
-		graph.addPlotter(new Metrics.DroxPlotter("Demote") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerDemote;
-				playerCommandExecutor.playerDemote = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Add SubGroup
-		graph.addPlotter(new Metrics.DroxPlotter("SubGroup Add") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerAddSub;
-				playerCommandExecutor.playerAddSub = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Remove SubGroup
-		graph.addPlotter(new Metrics.DroxPlotter("SubGroup Remove") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerRemSub;
-				playerCommandExecutor.playerRemSub = 0;
-				return getAvg(value);
-			}
-		});
-
-		// List Permissions
-		graph.addPlotter(new Metrics.DroxPlotter("List Permissions") {
-			@Override
-			public int getValue() {
-				int value = playerCommandExecutor.playerListPerms;
-				playerCommandExecutor.playerListPerms = 0;
-				return getAvg(value);
-			}
-		});
-
-		Metrics.Graph graph2 = metrics.createGraph("Command Usage (Groups)");
-
-		// Info Set
-		graph2.addPlotter(new Metrics.DroxPlotter("Info Set") {
-			@Override
-			public int getValue() {
-				int value = groupCommandExecutor.groupInfoSet;
-				groupCommandExecutor.groupInfoSet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Group Set
-		graph2.addPlotter(new Metrics.DroxPlotter("Group Set") {
-			@Override
-			public int getValue() {
-				int value = groupCommandExecutor.groupGroupSet;
-				groupCommandExecutor.groupGroupSet = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Add Permission
-		graph2.addPlotter(new Metrics.DroxPlotter("Permission Add") {
-			@Override
-			public int getValue() {
-				int value = groupCommandExecutor.groupPermAdd;
-				groupCommandExecutor.groupPermAdd = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Remove Permission
-		graph2.addPlotter(new Metrics.DroxPlotter("Permission Remove") {
-			@Override
-			public int getValue() {
-				int value = groupCommandExecutor.groupPermRem;
-				groupCommandExecutor.groupPermRem = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Add SubGroup
-		graph2.addPlotter(new Metrics.DroxPlotter("Subgroup Add") {
-			@Override
-			public int getValue() {
-				int value = groupCommandExecutor.groupAddSub;
-				groupCommandExecutor.groupAddSub = 0;
-				return getAvg(value);
-			}
-		});
-
-		// Remove SubGroup
-		graph2.addPlotter(new Metrics.DroxPlotter("Subgroup Remove") {
-			@Override
-			public int getValue() {
-				int value = groupCommandExecutor.groupRemSub;
-				groupCommandExecutor.groupRemSub = 0;
-				return getAvg(value);
-			}
-		});
-
-		// new Group
-		graph2.addPlotter(new Metrics.DroxPlotter("New Group") {
-			@Override
-			public int getValue() {
-				int value = groupCommandExecutor.groupNew;
-				groupCommandExecutor.groupNew = 0;
-				return getAvg(value);
-			}
-		});
-
-		// List Permissions
-		graph2.addPlotter(new Metrics.DroxPlotter("List Permissions") {
-			@Override
-			public int getValue() {
-				int value = groupCommandExecutor.groupListPerms;
-				groupCommandExecutor.groupListPerms = 0;
-				return getAvg(value);
-			}
-		});
-
-		metrics.start();
 	}
 }

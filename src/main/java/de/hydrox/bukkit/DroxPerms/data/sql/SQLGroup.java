@@ -187,21 +187,18 @@ public class SQLGroup extends AGroup {
 	@Override
 	public boolean setInfo(String node, String data) {
 		PreparedStatement prep = provider.prepAddGroupInfoNode;
-		int num = 0;
 		try {
 			prep.clearParameters();
 			prep.setInt(1, ID);
 			prep.setString(2, node);
 			prep.setString(3, data);
 			prep.setString(4, data);
-			num = prep.executeUpdate();
+			prep.executeUpdate();
 		} catch (SQLException e) {
 			SQLPermissions.mysqlError(e);
+			return false;
 		} 
-		if (num==1) {
-			return true;
-		}
-		return false;
+		return true;
 	}
 
 	@Override
